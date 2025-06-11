@@ -23,6 +23,18 @@ async def cancel_event(event_name: str, personnel_email: str = None) -> str:
     email_text = f" Cancellation email sent to {personnel_email}." if personnel_email else ""
     return f"[SIMULATION] ✅ Scheduled run for code file '{event_name}' would be cancelled.{email_text} (No real cancellation performed.)"
 
+@mcp.tool()
+async def list_scheduled_events() -> str:
+    """Dummy tool to simulate retrieving a list of scheduled code execution tasks."""
+    # This is a static dummy response for demonstration purposes.
+    return (
+        "[SIMULATION] 📋 Scheduled code executions:\n"
+        "1. code_file_a.py - Daily at 09:00 AM - Personnel: alice@example.com\n"
+        "2. code_file_b.py - Weekly on Monday at 02:00 PM - Personnel: bob@example.com\n"
+        "3. code_file_c.py - Monthly on the 1st at 11:00 AM - Personnel: carol@example.com\n"
+        "(No real schedule data. This is a dummy response.)"
+    )
+
 def main():
     # Read input from stdin (simulate MCPToolset stdio)
     input_data = sys.stdin.read()
