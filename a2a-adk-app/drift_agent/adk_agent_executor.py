@@ -2,151 +2,163 @@
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, List # Added List
 
 from a2a.server.agent_execution import AgentExecutor
 from a2a.server.agent_execution.context import RequestContext
 from a2a.server.events.event_queue import EventQueue
 from a2a.server.tasks import TaskUpdater
-from a2a.types import TaskState, Part, TextPart, FilePart, FileWithUri, FileWithBytes
-from google.adk import Runner
-from google.genai import types
+from a2a.types import TaskState, TaskStatus, TaskStatusUpdateEvent, TaskArtifactUpdateEvent # Kept for A2A interaction
+from a2a.utils import new_agent_text_message, new_task, new_text_artifact # For A2A event creation
+
+# Import the new Langchain agent
+from .adk_agent import DriftLangchainAgent # Assuming adk_agent.py now contains DriftLangchainAgent
+
+# If you create a Langchain tool for drift analysis (from drift_server.py)
+# from .drift_tool import DriftAnalysisTool # Example: if you create this tool
 
 logger = logging.getLogger(__name__)
 
-def convert_a2a_parts_to_genai(parts: list[Part]) -> list[types.Part]:
-    return [convert_a2a_part_to_genai(part) for part in parts]
-
-def convert_a2a_part_to_genai(part: Part) -> types.Part:
-    part = part.root
-    if isinstance(part, TextPart):
-        return types.Part(text=part.text)
-    if isinstance(part, FilePart):
-        if isinstance(part.file, FileWithUri):
-            return types.Part(
-                file_data=types.FileData(
-                    file_uri=part.file.uri, mime_type=part.file.mime_type
-                )
-            )
-        if isinstance(part.file, FileWithBytes):
-            return types.Part(
-                inline_data=types.Blob(
-                    data=part.file.bytes, mime_type=part.file.mime_type
-                )
-            )
-        raise ValueError(f"Unsupported file type: {type(part.file)}")
-    raise ValueError(f"Unsupported part type: {type(part)}")
-
-def convert_genai_parts_to_a2a(parts: list[types.Part]) -> list[Part]:
-    return [
-        convert_genai_part_to_a2a(part)
-        for part in parts
-        if (part.text or part.file_data or part.inline_data)
-    ]
-
-def convert_genai_part_to_a2a(part: types.Part) -> Part:
-    if part.text:
-        return TextPart(text=part.text)
-    if part.file_data:
-        return FilePart(
-            file=FileWithUri(
-                uri=part.file_data.file_uri,
-                mime_type=part.file_data.mime_type,
-            )
-        )
-    if part.inline_data:
-        return Part(
-            root=FilePart(
-                file=FileWithBytes(
-                    bytes=part.inline_data.data,
-                    mime_type=part.inline_data.mime_type,
-                )
-            )
-        )
-    raise ValueError(f"Unsupported part type: {part}")
+# Removed convert_a2a_parts_to_genai and convert_genai_parts_to_a2a as Langchain handles its own message formats
 
 class DriftAgentExecutor(AgentExecutor):
-    """Executes drift analysis and trend detection tasks."""
-    def __init__(self, runner: Runner, card):
-        self.runner = runner
-        self._card = card
-        self._running_sessions = {}
+    """Executes drift analysis tasks using a Langchain agent."""
 
-    def _run_agent(self, session_id, new_message: types.Content):
-        return self.runner.run_async(session_id=session_id, user_id="self", new_message=new_message)
+    def __init__(self, mcp_tools: List[Any] = None): # mcp_tools are now Langchain tools
+        """
+        Initializes the DriftAgentExecutor.
 
-    async def _process_request(self, new_message: types.Content, session_id: str, task_updater: TaskUpdater):
-        session_obj = await self._upsert_session(session_id)
-        session_id = session_obj.id
-        missing_model_prompted = False
-        async for event in self._run_agent(session_id, new_message):
-            if event.is_final_response():
-                parts = convert_genai_parts_to_a2a(event.content.parts)
-                # Check if drift analysis failed due to missing model and prompt user
-                if any("model" in (getattr(p, 'text', '') or '').lower() and "missing" in (getattr(p, 'text', '') or '').lower() for p in parts):
-                    if not missing_model_prompted:
-                        task_updater.add_artifact([
-                            TextPart(text="Please provide the model name for drift analysis.")
-                        ])
-                        missing_model_prompted = True
-                        task_updater.complete()
-                        break
-                elif parts:
-                    # Only emit the final tool result as user-facing output
-                    task_updater.add_artifact(parts)
-                    task_updater.complete()
-                    break
-                else:
-                    # If no parts, do not emit any message
-                    task_updater.complete()
-                    break
-            # Do not emit any user-facing artifact for non-final responses
-            # Only update status internally
-            if not event.get_function_calls():
-                task_updater.update_status(TaskState.working)
-
-    async def execute(self, context: RequestContext, event_queue: EventQueue):
-        updater = TaskUpdater(event_queue, context.task_id, context.context_id)
-        if not context.current_task:
-            updater.submit()
-        updater.start_work()
-        await self._process_request(
-            types.UserContent(parts=convert_a2a_parts_to_genai(context.message.parts)),
-            context.context_id,
-            updater,
+        Args:
+            mcp_tools: A list of Langchain tools for the DriftLangchainAgent.
+        """
+        super().__init__()
+        logger.info(
+            f"Initializing DriftAgentExecutor with {len(mcp_tools) if mcp_tools else 'no'} Langchain tools."
         )
+        # Initialize the Langchain agent
+        # If DriftAnalysisTool is created, pass it here:
+        # self.drift_analysis_tool = DriftAnalysisTool()
+        # self.agent = DriftLangchainAgent(mcp_tools=[self.drift_analysis_tool] + (mcp_tools or []))
+        self.agent = DriftLangchainAgent(mcp_tools=mcp_tools)
+        # self._running_sessions = {} # Langchain agents manage their own state/memory if needed
 
-    async def analyze_drift(self, run_data: list[dict[str, Any]]):
-        # Simulate drift analysis logic
-        print("Analyzing drift and trends across code runs...")
-        # Example: find changes in metrics, anomalies, or trends
-        if not run_data:
-            print("No run data provided.")
-            return {"status": "no_data"}
-        # Simulate a trend summary
-        print(f"Analyzed {len(run_data)} runs. Example trend: metric X is increasing.")
-        return {"status": "analyzed", "trend": "metric X is increasing"}
+    # _run_agent method is removed as we directly use the Langchain agent's stream/ainvoke
 
-    async def handle_request(self, request: dict[str, Any]):
-        run_data = request.get("run_data", [])
-        result = await self.analyze_drift(run_data)
-        return result
+    # _process_request is replaced by the execute method's direct call to the Langchain agent
+    
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        query = context.get_user_input()
+        task = context.current_task
 
-    async def cancel(self, context: RequestContext, event_queue: EventQueue):
+        if not context.message:
+            # This case should ideally be handled by the A2A server before reaching here
+            logger.error("No message provided in RequestContext.")
+            # Optionally, send an error event back
+            if task:
+                 event_queue.enqueue_event(
+                    TaskStatusUpdateEvent(
+                        status=TaskStatus(state=TaskState.error, message=new_agent_text_message("Error: No input message received.", task.contextId, task.id)),
+                        final=True,
+                        contextId=task.contextId,
+                        taskId=task.id,
+                    )
+                )
+            return
+
+        if not task:
+            task = new_task(context.message) # Create a new task if none exists
+            event_queue.enqueue_event(task)
+        
+        # Ensure task_id and context_id are available for A2A events
+        task_id = task.id
+        context_id = task.contextId
+
+        logger.info(f"Executing DriftLangchainAgent for task {task_id} with query: '{query}'")
+
+        try:
+            async for event in self.agent.stream(query, context_id): # Use context_id as sessionId for Langchain agent if it uses it for memory
+                # Adapt the event structure from Langchain agent to A2A events
+                # The 'event' from Langchain agent.stream is expected to be a dict like:
+                # {"is_task_complete": bool, "require_user_input": bool, "content": str}
+
+                if event.get("is_task_complete"):
+                    event_queue.enqueue_event(
+                        TaskArtifactUpdateEvent(
+                            append=False, # Assuming final content replaces previous
+                            contextId=context_id,
+                            taskId=task_id,
+                            lastChunk=True,
+                            artifact=new_text_artifact(
+                                name="drift_analysis_result",
+                                description="Result of drift analysis.",
+                                text=event.get("content", "No content from agent."),
+                            ),
+                        )
+                    )
+                    event_queue.enqueue_event(
+                        TaskStatusUpdateEvent(
+                            status=TaskStatus(state=TaskState.completed),
+                            final=True,
+                            contextId=context_id,
+                            taskId=task_id,
+                        )
+                    )
+                elif event.get("require_user_input"):
+                    event_queue.enqueue_event(
+                        TaskStatusUpdateEvent(
+                            status=TaskStatus(
+                                state=TaskState.input_required,
+                                message=new_agent_text_message(
+                                    event.get("content", "Input required."),
+                                    context_id,
+                                    task_id,
+                                ),
+                            ),
+                            final=True, # Typically input_required is a final state for the current turn
+                            contextId=context_id,
+                            taskId=task_id,
+                        )
+                    )
+                else: # Intermediate content/streaming update
+                    event_queue.enqueue_event(
+                        TaskStatusUpdateEvent(
+                            status=TaskStatus(
+                                state=TaskState.working,
+                                message=new_agent_text_message(
+                                    event.get("content", "Processing..."),
+                                    context_id,
+                                    task_id,
+                                ),
+                            ),
+                            final=False,
+                            contextId=context_id,
+                            taskId=task_id,
+                        )
+                    )
+        except Exception as e:
+            logger.error(f"Error executing DriftLangchainAgent for task {task_id}: {e}", exc_info=True)
+            event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    status=TaskStatus(state=TaskState.error, message=new_agent_text_message(f"Error during drift analysis: {e}", context_id, task_id)),
+                    final=True,
+                    contextId=context_id,
+                    taskId=task_id,
+                )
+            )
+
+    # analyze_drift and handle_request methods are removed,
+    # as this logic should now be part of a Langchain tool and invoked by the DriftLangchainAgent.
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # Langchain agent cancellation is not as straightforward as ADK's runner.
+        # It might involve interrupting the asyncio task running the agent's stream/ainvoke.
+        # For now, we'll just update the task status.
+        logger.info(f"Cancellation requested for task {context.task_id}")
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
-        updater.cancel()
+        updater.cancel() 
+        # In a real scenario, you might need to signal the streaming Langchain agent to stop.
 
-    async def _upsert_session(self, session_id: str):
-        session = await self.runner.session_service.get_session(
-            app_name=self.runner.app_name, user_id="self", session_id=session_id
-        )
-        if session is None:
-            session = await self.runner.session_service.create_session(
-                app_name=self.runner.app_name, user_id="self", session_id=session_id
-            )
-        if session is None:
-            logger.error(
-                f"Critical error: Session is None even after create_session for session_id: {session_id}"
-            )
-            raise RuntimeError(f"Failed to get or create session: {session_id}")
-        return session
+    # _upsert_session is removed as session management is not directly handled by this executor
+    # in the same way as with google.adk.Runner. Langchain's memory mechanisms would handle session state if configured.
+
+# ... (rest of the file, if any, though likely not needed)

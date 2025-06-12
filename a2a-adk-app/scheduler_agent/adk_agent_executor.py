@@ -2,165 +2,132 @@
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, AsyncIterator, Dict
+import json
 
-from a2a.server.agent_execution import AgentExecutor
+# Imports from the A2A framework - ensure these are available in your environment
+from a2a.server.agent_execution import AgentExecutor as A2AExecutorBase # Renamed to avoid clash
 from a2a.server.agent_execution.context import RequestContext
 from a2a.server.events.event_queue import EventQueue
 from a2a.server.tasks import TaskUpdater
-from a2a.types import TaskState, Part, TextPart, FilePart, FileWithUri, FileWithBytes
-from google.adk import Runner
-from google.genai import types
+from a2a.types import TaskState, Part, TextPart
+
+# Import the custom Langchain agent
+from .adk_agent import SchedulerLangchainAgent #, create_agent # create_agent might not be used directly by executor
 
 logger = logging.getLogger(__name__)
 
-def convert_a2a_parts_to_genai(parts: list[Part]) -> list[types.Part]:
-    return [convert_a2a_part_to_genai(part) for part in parts]
+class SchedulerAgentExecutor(A2AExecutorBase):
+    """Executes scheduling tasks using a Langchain agent and reports status via A2A protocol."""
 
-def convert_a2a_part_to_genai(part: Part) -> types.Part:
-    part = part.root
-    if isinstance(part, TextPart):
-        return types.Part(text=part.text)
-    if isinstance(part, FilePart):
-        if isinstance(part.file, FileWithUri):
-            return types.Part(
-                file_data=types.FileData(
-                    file_uri=part.file.uri, mime_type=part.file.mime_type
-                )
-            )
-        if isinstance(part.file, FileWithBytes):
-            return types.Part(
-                inline_data=types.Blob(
-                    data=part.file.bytes, mime_type=part.file.mime_type
-                )
-            )
-        raise ValueError(f"Unsupported file type: {type(part.file)}")
-    raise ValueError(f"Unsupported part type: {type(part)}")
+    def __init__(self, agent: SchedulerLangchainAgent, card: Any): 
+        self.agent = agent
+        self._card = card 
 
-def convert_genai_parts_to_a2a(parts: list[types.Part]) -> list[Part]:
-    return [
-        convert_genai_part_to_a2a(part)
-        for part in parts
-        if (part.text or part.file_data or part.inline_data)
-    ]
+    async def _process_request(
+        self, input_text: str, session_id: str, task_updater: TaskUpdater
+    ):
+        """Processes the request by streaming from the Langchain agent and updating the task."""
+        final_response_artifact = None
+        agent_produced_output = False
 
-def convert_genai_part_to_a2a(part: types.Part) -> Part:
-    if part.text:
-        return TextPart(text=part.text)
-    if part.file_data:
-        return FilePart(
-            file=FileWithUri(
-                uri=part.file_data.file_uri,
-                mime_type=part.file_data.mime_type,
-            )
-        )
-    if part.inline_data:
-        return Part(
-            root=FilePart(
-                file=FileWithBytes(
-                    bytes=part.inline_data.data,
-                    mime_type=part.inline_data.mime_type,
-                )
-            )
-        )
-    raise ValueError(f"Unsupported part type: {part}")
+        try:
+            async for log_entry in self.agent.stream(input_text):
+                agent_produced_output = True 
 
-class SchedulerAgentExecutor(AgentExecutor):
-    """Executes scheduling tasks and handles email confirmation logic."""
-    def __init__(self, runner: Runner, card):
-        self.runner = runner
-        self._card = card
-        self._running_sessions = {}
+                if log_entry["type"] == "agent" and log_entry["name"] == "AgentAction":
+                    action_data = log_entry["data"]
+                    tool_name = action_data.get('tool')
+                    tool_input = action_data.get('tool_input')
+                    logger.info(f"Agent action: tool={tool_name}, input={tool_input}")
+                    task_updater.update_status(TaskState.working, message=f"Agent is using tool: {tool_name}")
 
-    def _run_agent(self, session_id, new_message: types.Content):
-        return self.runner.run_async(session_id=session_id, user_id="self", new_message=new_message)
+                elif log_entry["type"] == "tool" and log_entry["name"] == "ToolExecution":
+                    tool_data = log_entry["data"]
+                    tool_name = tool_data.get('tool_name')
+                    logger.info(f"Tool execution: tool={tool_name} completed.")
+                    task_updater.update_status(TaskState.working, message=f"Tool {tool_name} executed.")
 
-    async def _process_request(self, new_message: types.Content, session_id: str, task_updater: TaskUpdater):
-        session_obj = await self._upsert_session(session_id)
-        session_id = session_obj.id
-        missing_email_prompted = False
-        async for event in self._run_agent(session_id, new_message):
-            if event.is_final_response():
-                parts = convert_genai_parts_to_a2a(event.content.parts)
-                # Check if scheduling failed due to missing email and prompt user
-                if any("email" in (getattr(p, 'text', '') or '').lower() and "missing" in (getattr(p, 'text', '') or '').lower() for p in parts):
-                    if not missing_email_prompted:
-                        task_updater.add_artifact([
-                            TextPart(text="Please provide the email address for scheduling confirmation.")
-                        ])
-                        missing_email_prompted = True
-                        task_updater.complete()
-                        break
-                elif parts:
-                    # Only emit the final tool result as user-facing output
-                    task_updater.add_artifact(parts)
-                    task_updater.complete()
-                    break
-                else:
-                    # If no parts, do not emit any message
-                    task_updater.complete()
-                    break
-            # Do not emit any user-facing artifact for non-final responses
-            # Only update status internally
-            if not event.get_function_calls():
-                task_updater.update_status(TaskState.working)
+                elif log_entry["type"] == "agent" and log_entry["name"] == "AgentFinish":
+                    finish_data = log_entry["data"]
+                    final_output_str = finish_data.get("output") 
+                    logger.info(f"Agent finished. Raw output from agent: {final_output_str}")
+
+                    if final_output_str:
+                        final_response_artifact = TextPart(text=final_output_str)
+                        
+                        try:
+                            tool_response_json = json.loads(final_output_str)
+                            confirmation_msg = str(tool_response_json.get("confirmation_message", "")).lower()
+                            details_msg = str(tool_response_json.get("details", "")).lower()
+
+                            if ("please provide the email" in confirmation_msg or 
+                                "please provide the email" in details_msg):
+                                final_response_artifact = TextPart(
+                                    text=json.dumps({
+                                        "status": "user_prompt",
+                                        "details": "Please provide the email address for scheduling confirmation."
+                                    })
+                                )
+                        except json.JSONDecodeError:
+                            logger.warning(f"Final output from agent was not the expected JSON from a tool: {final_output_str}")
+                    else:
+                        logger.warning("AgentFinish event had no 'output' data.")
+                        final_response_artifact = TextPart(text="Agent finished without providing output.")
+                    break 
+
+                elif log_entry["type"] == "llm":
+                    task_updater.update_status(TaskState.working, message="Agent is processing...")
+
+            if not agent_produced_output:
+                logger.warning("Agent stream completed without yielding any log entries.")
+                task_updater.fail(message="Agent did not produce any output.")
+                return
+
+            if final_response_artifact:
+                task_updater.add_artifact([final_response_artifact])
+                task_updater.complete()
+            else:
+                logger.warning("Agent stream finished, but no final response artifact was generated.")
+                task_updater.fail(message="Agent did not produce a conclusive final response.")
+
+        except Exception as e:
+            logger.exception(f"Error during scheduler agent processing: {e}") # Use logger.exception for stack trace
+            task_updater.fail(message=f"An error occurred in scheduler agent: {str(e)}")
 
     async def execute(self, context: RequestContext, event_queue: EventQueue):
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
         if not context.current_task:
             updater.submit()
         updater.start_work()
+
+        raw_input_parts = []
+        for part_wrapper in context.message.parts:
+            part = part_wrapper.root
+            if isinstance(part, TextPart):
+                raw_input_parts.append(part.text)
+        
+        input_text = " ".join(raw_input_parts).strip()
+
+        if not input_text:
+            # The scheduler agent's prompt asks it to clarify if info is missing.
+            # Sending a generic prompt might be okay, or a specific "what do you want to schedule?"
+            input_text = "What would you like to do with the scheduler? (e.g., schedule an event, cancel an event, list events)"
+            # Alternatively, fail if input is truly empty and critical.
+            # logger.warning(f"Task {context.task_id}: No input text for scheduler agent.")
+            # updater.add_artifact([TextPart(text="Error: No input provided for the scheduling task.")])
+            # updater.fail(message="Missing input for scheduler agent.")
+            # return
+
+        logger.info(f"Executing scheduler agent for task {context.task_id} with input: '{input_text[:100]}...'")
+        
         await self._process_request(
-            types.UserContent(parts=convert_a2a_parts_to_genai(context.message.parts)),
-            context.context_id,
-            updater,
+            input_text=input_text,
+            session_id=context.context_id, 
+            task_updater=updater,
         )
-
-    async def schedule_code(self, code_path: str, schedule_type: str, personnel_email: str):
-        # Simulate scheduling logic
-        # schedule_type: 'daily', 'weekly', 'monthly', 'manual'
-        # Send confirmation email (simulated)
-        print(f"Scheduling {code_path} as {schedule_type} for {personnel_email}")
-        await self.send_confirmation_email(personnel_email, code_path, schedule_type)
-
-    async def send_confirmation_email(self, email: str, code_path: str, schedule_type: str):
-        # Simulate sending an email with Confirm, Cancel, Snooze buttons
-        print(f"Sending confirmation email to {email} for {code_path} [{schedule_type}]")
-        print("[Confirm] [Cancel] [Snooze]")
-        # In a real implementation, integrate with an email API and handle button callbacks
-
-    async def run_code(self, code_path: str):
-        # Simulate running the code file
-        print(f"Running code: {code_path}")
-        # In a real implementation, use subprocess or similar to execute the code
-        await asyncio.sleep(1)
-        print(f"Execution complete: {code_path}")
-
-    async def handle_request(self, request: dict[str, Any]):
-        # Entry point for handling scheduling requests
-        code_path = request.get("code_path")
-        schedule_type = request.get("schedule_type", "manual")
-        personnel_email = request.get("personnel_email")
-        if not code_path or not personnel_email:
-            return {"status": "error", "message": "Missing code_path or personnel_email"}
-        await self.schedule_code(code_path, schedule_type, personnel_email)
-        return {"status": "scheduled", "code_path": code_path, "schedule_type": schedule_type}
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue):
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+        logger.info(f"Cancellation requested for task {context.task_id} of scheduler agent.")
         updater.cancel()
-
-    async def _upsert_session(self, session_id: str):
-        session = await self.runner.session_service.get_session(
-            app_name=self.runner.app_name, user_id="self", session_id=session_id
-        )
-        if session is None:
-            session = await self.runner.session_service.create_session(
-                app_name=self.runner.app_name, user_id="self", session_id=session_id
-            )
-        if session is None:
-            logger.error(
-                f"Critical error: Session is None even after create_session for session_id: {session_id}"
-            )
-            raise RuntimeError(f"Failed to get or create session: {session_id}")
-        return session
