@@ -33,7 +33,7 @@ RESPONSE_FORMAT_INSTRUCTION_STR = '''{
 }'''
 
 class SchedulerLangchainAgent:
-    def __init__(self, llm_model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"):
+    def __init__(self, llm_model_name: str = "HuggingFaceH4/zephyr-7b-alpha"):
         self.llm = HuggingFaceHub(
             repo_id=llm_model_name,
             model_kwargs={"temperature": 0.7, "max_length": 1024},

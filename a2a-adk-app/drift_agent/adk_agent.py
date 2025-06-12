@@ -55,10 +55,10 @@ class DriftLangchainAgent:
         logger.info("Initializing DriftLangchainAgent...")
         try:
             # Replace with your chosen Hugging Face model
-            # This might require HUGGINGFACEHUB_API_TOKEN if using a model from the Hub that's not free
-            # For truly API-key-free, you'd use a locally downloaded model with HuggingFacePipeline or similar
+            # This might require HUGGINGFACEHUB_API_TOKEN if using a model from the Hub that\'s not free
+            # For truly API-key-free, you\'d use a locally downloaded model with HuggingFacePipeline or similar
             self.model = HuggingFaceHub(
-                repo_id="mistralai/Mistral-7B-Instruct-v0.2", # Example
+                repo_id="HuggingFaceH4/zephyr-7b-alpha", # Changed to Zephyr
                 # Ensure HUGGINGFACEHUB_API_TOKEN is set in environment if needed by model/Hub
                 model_kwargs={"temperature": 0.7, "max_length": 1024} # Increased max_length
             )

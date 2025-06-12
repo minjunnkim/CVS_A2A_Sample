@@ -8,8 +8,7 @@ from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool
 
 from a2a.types import SendMessageRequest, MessageSendParams, SendMessageSuccessResponse, Task, Part
-# Ensure RemoteAgentConnections is accessible, adjust import path as necessary
-# from ..adk_agent.remote_agent_connection import RemoteAgentConnections
+from .remote_agent_connection import RemoteAgentConnections # Adjusted import path
 # For now, assuming it will be in the same directory or Python path handles it.
 # We will pass RemoteAgentConnections instances directly to the tool.
 

@@ -15,14 +15,16 @@ from pydantic import BaseModel
 from a2a.client import A2ACardResolver
 from a2a.types import AgentCard
 from host_agent.host_tools import SendMessageToRemoteAgentTool
-from host_agent.adk_agent.remote_agent_connection import RemoteAgentConnections
+from host_agent.remote_agent_connection import RemoteAgentConnections  # Adjusted import path
 
 # Load environment variables
 from dotenv import load_dotenv
+
 load_dotenv()
 
 HUGGINGFACEHUB_API_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
-DEFAULT_MODEL_REPO_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+DEFAULT_MODEL_REPO_ID = "HuggingFaceH4/zephyr-7b-alpha"  # Changed to Zephyr
+
 
 class HostLangchainAgent:
     """
@@ -38,9 +40,9 @@ class HostLangchainAgent:
         self.llm = HuggingFaceHub(
             repo_id=llm_repo_id,
             huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
-            model_kwargs={"temperature": 0.7, "max_new_tokens": 1024}
+            model_kwargs={"temperature": 0.7, "max_new_tokens": 1024},
         )
-        self.tools: List[Tool] = [] 
+        self.tools: List[Tool] = []
         self.agent_executor: Optional[AgentExecutor] = None
         # Per-session state, keyed by session_id
         self.session_states: Dict[str, Dict[str, Any]] = {}
@@ -78,7 +80,7 @@ class HostLangchainAgent:
         """Initializes the tools for the agent."""
         if not self.remote_agent_connections:
             print("WARNING: Remote agent connections not established. SendMessageTool will not be effective.")
-        
+
         # The tool needs access to the connections, but not direct access to session_states
         # Session-specific data like task_id, context_id will be passed during _arun
         self.tools = [
@@ -143,8 +145,8 @@ class HostLangchainAgent:
             agent=create_react_agent(llm=self.llm, tools=self.tools, prompt=prompt_template),
             tools=self.tools,
             verbose=True,
-            handle_parsing_errors=True, # Handle potential output parsing errors
-            max_iterations=5 # Prevent overly long chains
+            handle_parsing_errors=True,  # Handle potential output parsing errors
+            max_iterations=5,  # Prevent overly long chains
         )
         print("HostLangchainAgent executor initialized.")
 
@@ -153,8 +155,8 @@ class HostLangchainAgent:
         """Factory method to create and asynchronously initialize an instance."""
         instance = cls(remote_agent_addresses, llm_repo_id)
         await instance._initialize_remote_connections()
-        instance._initialize_tools() # Tools depend on connections
-        instance._initialize_agent_executor() # Agent executor depends on tools and prompt (which needs descriptions)
+        instance._initialize_tools()  # Tools depend on connections
+        instance._initialize_agent_executor()  # Agent executor depends on tools and prompt (which needs descriptions)
         return instance
 
     def _get_or_create_session_state(self, session_id: str) -> Dict[str, Any]:
@@ -162,17 +164,17 @@ class HostLangchainAgent:
             self.session_states[session_id] = {
                 "task_id": uuid.uuid4().hex,
                 "context_id": uuid.uuid4().hex,
-                "active_agent": "None", # Name of the agent currently handling a task for this session
-                "call_history": {}, # History of calls to remote agents for this session {signature: {time: ts, response: resp}}
-                "task_interaction_history": [] # Simplified history of (user_query, agent_response) for current task
+                "active_agent": "None",  # Name of the agent currently handling a task for this session
+                "call_history": {},  # History of calls to remote agents for this session {signature: {time: ts, response: resp}}
+                "task_interaction_history": [],  # Simplified history of (user_query, agent_response) for current task
             }
         return self.session_states[session_id]
-    
+
     def _is_new_task_heuristic(self, current_message: str, session_state: Dict[str, Any], new_agent_selected_by_llm: Optional[str]) -> bool:
         """Determines if the current message likely starts a new task."""
         if session_state["active_agent"] == "None":
-            return True # No active agent, so it's a new task
-        
+            return True  # No active agent, so it's a new task
+
         if new_agent_selected_by_llm and new_agent_selected_by_llm != session_state["active_agent"]:
             # LLM wants to switch agent, could be a new task or a complex multi-agent task.
             # For simplicity now, we treat agent switch as a new task context.
@@ -190,7 +192,7 @@ class HostLangchainAgent:
             return "Error: Host agent executor is not initialized."
 
         session_state = self._get_or_create_session_state(session_id)
-        
+
         # The agent's ReAct prompt needs to know about the current active agent and history for *this session*.
         # The SendMessageToRemoteAgentTool also needs task_id, context_id, and call_history for *this session*.
 
@@ -276,9 +278,11 @@ class HostLangchainAgent:
 
         except Exception as e:
             import traceback
+
             print(f"Error processing message in HostLangchainAgent: {e}")
             traceback.print_exc()
             return f"Error: Could not process your request due to an internal error: {e}"
+
 
 async def main():
     # Example usage:
@@ -288,9 +292,9 @@ async def main():
         os.getenv("DRIFT_AGENT_URL", "http://localhost:11003"),
     ]
     host_agent = await HostLangchainAgent.create(remote_agent_addresses=remote_addresses)
-    
+
     session_1 = "session_abc_123"
-    
+
     print("\n--- Test Case 1: Schedule a new event ---")
     response1 = await host_agent.process_message(session_1, "Can you schedule a meeting for tomorrow at 2 PM about project Alpha?")
     print(f"Session {session_1} Response 1: {response1}")
